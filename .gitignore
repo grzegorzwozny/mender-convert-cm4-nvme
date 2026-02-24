@@ -4,3 +4,7 @@ mender_local_config
 *.xml
 *.html
 logs/convert.log*
+assets/*.tar.gz
+assets/*.tgz
+*.orig
+*.rej

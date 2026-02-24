@@ -272,6 +272,31 @@ disk_get_partuuid_dos_part_number() {
 #
 # $1 - partition number to use if fine grained variable not set
 # $2 - fine grained device part variable name
+disk_get_part_separator() {
+    case "$1" in
+        *[0-9])
+            # Devices that end with a digit require a "p" before the partition number.
+            echo "p"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+disk_get_part_device_from_base() {
+    local device_base="$1"
+    local part_number="$2"
+    local separator=""
+
+    if [ -z "${device_base}" ] || [ -z "${part_number}" ]; then
+        log_fatal "Could not construct partition path from '${device_base}' and '${part_number}'"
+    fi
+
+    separator=$(disk_get_part_separator "${device_base}")
+    echo "${device_base}${separator}${part_number}"
+}
+
 disk_get_part_device() {
     part="${!2}"
     if [ "${MENDER_ENABLE_PARTUUID}" == "y" ]; then
@@ -279,7 +304,7 @@ disk_get_part_device() {
             log_fatal "Invalid partuuid device for ${2}: '${part}'"
         fi
     else
-        part="${MENDER_STORAGE_DEVICE_BASE}${1}"
+        part=$(disk_get_part_device_from_base "${MENDER_STORAGE_DEVICE_BASE}" "${1}")
     fi
     echo "${part}"
 }

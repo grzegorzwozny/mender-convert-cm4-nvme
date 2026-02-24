@@ -68,6 +68,37 @@ These configurations have been submitted by community contributors.
 | rockpro64_emmc_config | RockPro64, Debian 32bit on internal eMMC storage |
 | rockpro64_sd_config | RockPro64, Debian 32bit on external SD card storage |
 
+## CM4 NVMe U-Boot workflow
+
+For CM4/RPi4 NVMe boot with `uboot-mender`, use:
+
+- `scripts/uboot/README.md`
+- `scripts/uboot/build-uboot-rpi64-nvme.sh`
+- `configs/local/cm4_nvme_trixie_64_ab6gb_config`
+- `docs/cm4-nvme.md`
+
+The helper script builds a NVMe-enabled U-Boot tarball in `assets/`, and the
+local config is pre-wired to consume that tarball during conversion.
+
+Quick start:
+
+```bash
+scripts/uboot/build-uboot-rpi64-nvme.sh
+export MENDER_ARTIFACT_NAME="cm4-nvme-trixie-ab6gb"
+sudo --preserve-env=MENDER_ARTIFACT_NAME ./mender-convert \
+  --disk-image input/<your-raspios-image>.img \
+  --config configs/local/cm4_nvme_trixie_64_ab6gb_config
+```
+
+On first boot with a newly flashed NVMe U-Boot, reset saved env once in the
+U-Boot console so stale `mender_*` values do not force old MMC paths:
+
+```text
+env default -a
+saveenv
+reset
+```
+
 ## Example usage: Raspberry Pi 4, Raspberry Pi OS 64bit
 
 ### Prepare image and configuration

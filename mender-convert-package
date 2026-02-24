@@ -21,6 +21,123 @@ function platform_package() {
 }
 PLATFORM_PACKAGE_HOOKS=(platform_package)
 
+function package_boot_mount_location() {
+    if [ -n "${MENDER_BOOT_PART_MOUNT_LOCATION:-}" ]; then
+        echo "${MENDER_BOOT_PART_MOUNT_LOCATION}"
+    elif [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
+        echo "/boot/efi"
+    else
+        echo "/uboot"
+    fi
+}
+
+function package_update_fstab_with_partuuid() {
+    local boot_partuuid="$1"
+    local data_partuuid="$2"
+    local boot_mount_location=""
+    local tmp_fstab="work/fstab.partuuid"
+    local ret=0
+
+    boot_mount_location="$(package_boot_mount_location)"
+
+    if awk \
+        -v boot_dev="PARTUUID=${boot_partuuid}" \
+        -v data_dev="PARTUUID=${data_partuuid}" \
+        -v boot_mount="${boot_mount_location}" \
+        '
+            BEGIN { found_boot=0; found_data=0 }
+            $2 == boot_mount { $1 = boot_dev; found_boot=1 }
+            $2 == "/data" { $1 = data_dev; found_data=1 }
+            { print }
+            END {
+                if (!found_boot) exit 10
+                if (!found_data) exit 11
+            }
+        ' \
+        work/rootfs/etc/fstab > "${tmp_fstab}"; then
+        true
+    else
+        ret=$?
+        case "${ret}" in
+            10)
+                log_fatal "Could not find '${boot_mount_location}' entry in work/rootfs/etc/fstab"
+                ;;
+            11)
+                log_fatal "Could not find '/data' entry in work/rootfs/etc/fstab"
+                ;;
+            *)
+                log_fatal "Failed to update work/rootfs/etc/fstab with PARTUUID entries"
+                ;;
+        esac
+    fi
+
+    run_and_log_cmd "sudo mv ${tmp_fstab} work/rootfs/etc/fstab"
+}
+
+function package_update_mender_conf_with_partuuid() {
+    local rootfsa_partuuid="$1"
+    local rootfsb_partuuid="$2"
+
+    if [ ! -f work/data/mender/mender.conf ]; then
+        log_fatal "Could not find work/data/mender/mender.conf"
+    fi
+
+    cat <<- EOF > work/mender.conf.data
+{
+  "RootfsPartA": "/dev/disk/by-partuuid/${rootfsa_partuuid}",
+  "RootfsPartB": "/dev/disk/by-partuuid/${rootfsb_partuuid}"
+}
+EOF
+    run_and_log_cmd "sudo cp work/mender.conf.data work/data/mender/mender.conf"
+    run_and_log_cmd "sudo chmod 600 work/data/mender/mender.conf"
+}
+
+function package_read_partuuid_from_loop_part() {
+    local loop_device="$1"
+    local part_number="$2"
+    local part_device=""
+    local partuuid=""
+
+    part_device=$(disk_get_part_device_from_base "${loop_device}" "${part_number}")
+    partuuid=$(run_and_log_cmd_with_output_noexit "sudo blkid -s PARTUUID -o value '${part_device}'")
+    if [ $? -ne 0 ] || [ -z "${partuuid}" ]; then
+        log_fatal "Could not determine PARTUUID for '${part_device}'"
+    fi
+    echo "${partuuid}"
+}
+
+function package_inject_generated_partuuids() {
+    if [ "${MENDER_FORCE_PARTUUID_FSTAB:-n}" != "y" ] &&
+        [ "${MENDER_FORCE_PARTUUID_MENDER_CONF:-n}" != "y" ]; then
+        return
+    fi
+
+    local loop_device=""
+    local boot_partuuid=""
+    local rootfsa_partuuid=""
+    local rootfsb_partuuid=""
+    local data_partuuid=""
+
+    loop_device=$(run_and_log_cmd_with_output "sudo losetup --show -fP '${img_path}'")
+
+    boot_partuuid=$(package_read_partuuid_from_loop_part "${loop_device}" "${MENDER_BOOT_PART_NUMBER}")
+    rootfsa_partuuid=$(package_read_partuuid_from_loop_part "${loop_device}" "${MENDER_ROOTFS_PART_A_NUMBER}")
+    rootfsb_partuuid=$(package_read_partuuid_from_loop_part "${loop_device}" "${MENDER_ROOTFS_PART_B_NUMBER}")
+    data_partuuid=$(package_read_partuuid_from_loop_part "${loop_device}" "${MENDER_DATA_PART_NUMBER}")
+
+    run_and_log_cmd "sudo losetup -d '${loop_device}'"
+
+    if [ "${MENDER_FORCE_PARTUUID_FSTAB:-n}" == "y" ]; then
+        log_info "Injecting PARTUUID entries into /etc/fstab"
+        package_update_fstab_with_partuuid "${boot_partuuid}" "${data_partuuid}"
+    fi
+
+    if [ "${MENDER_FORCE_PARTUUID_MENDER_CONF:-n}" == "y" ]; then
+        log_info "Injecting PARTUUID entries into data/mender/mender.conf"
+        package_update_mender_conf_with_partuuid "${rootfsa_partuuid}" "${rootfsb_partuuid}"
+    fi
+}
+
 function trap_exit() {
     echo "mender-convert-package has finished. Cleaning up..."
     sudo umount -f work/boot > /dev/null 2>&1 || true
@@ -221,34 +338,6 @@ if [[ "${MENDER_CLIENT_INSTALL}" == y ]]; then
     fi
 fi
 
-disk_create_file_system_from_folder "work/rootfs/" "work/rootfs.img" \
-    "${rootfs_image_sectors}" "${image_fs_type}"
-
-log_info "Copying root filesystem image to deploy directory"
-run_and_log_cmd "cp --sparse=always work/rootfs.img deploy/${image_name}.${image_fs_type}"
-
-# Add the bootstrap Artifact to the data.img before packaging
-# the data image
-log_info "Installing the bootstrap Artifact"
-rootfs_img_checksum=$(sha256sum work/rootfs.img | cut -d ' ' -f1)
-run_and_log_cmd "mender-artifact write bootstrap-artifact \
-                    --artifact-name "${MENDER_ARTIFACT_NAME}" \
-                    --no-progress \
-                    --device-type  "${device_type}" \
-                    --provides rootfs-image.version:"${MENDER_ARTIFACT_NAME}" \
-                    --provides rootfs-image.checksum:${rootfs_img_checksum} \
-                    --clears-provides 'rootfs-image.*' \
-                    --output-path work/data/mender/bootstrap.mender"
-
-disk_create_file_system_from_folder "work/data/" "work/data.img" \
-    "${data_part_sectors}" "${image_fs_type}"
-run_and_log_cmd "rm -rf work/data"
-
-if [ "${MENDER_CLIENT_INSTALL}" != "y" ]; then
-    log_warn "Generating Artifact with no Mender client in it; not suitable for deployment"
-fi
-mender_create_artifact "${device_type}" "${MENDER_ARTIFACT_NAME}" "${image_name}"
-
 log_info "Creating Mender compatible disk-image"
 
 img_path="deploy/${image_name}.img"
@@ -331,6 +420,36 @@ if [ "${MENDER_ENABLE_PARTUUID}" == "y" ]; then
         run_and_log_cmd "swap_int32 0x${diskid} | xxd -r -p | dd of='${img_path}' bs=1 seek=440 count=4 conv=notrunc"
     fi
 fi
+
+package_inject_generated_partuuids
+
+disk_create_file_system_from_folder "work/rootfs/" "work/rootfs.img" \
+    "${rootfs_image_sectors}" "${image_fs_type}"
+
+log_info "Copying root filesystem image to deploy directory"
+run_and_log_cmd "cp --sparse=always work/rootfs.img deploy/${image_name}.${image_fs_type}"
+
+# Add the bootstrap Artifact to the data.img before packaging
+# the data image
+log_info "Installing the bootstrap Artifact"
+rootfs_img_checksum=$(sha256sum work/rootfs.img | cut -d ' ' -f1)
+run_and_log_cmd "mender-artifact write bootstrap-artifact \
+                    --artifact-name "${MENDER_ARTIFACT_NAME}" \
+                    --no-progress \
+                    --device-type  "${device_type}" \
+                    --provides rootfs-image.version:"${MENDER_ARTIFACT_NAME}" \
+                    --provides rootfs-image.checksum:${rootfs_img_checksum} \
+                    --clears-provides 'rootfs-image.*' \
+                    --output-path work/data/mender/bootstrap.mender"
+
+disk_create_file_system_from_folder "work/data/" "work/data.img" \
+    "${data_part_sectors}" "${image_fs_type}"
+run_and_log_cmd "rm -rf work/data"
+
+if [ "${MENDER_CLIENT_INSTALL}" != "y" ]; then
+    log_warn "Generating Artifact with no Mender client in it; not suitable for deployment"
+fi
+mender_create_artifact "${device_type}" "${MENDER_ARTIFACT_NAME}" "${image_name}"
 
 # Write boot-gap
 if [ "${MENDER_COPY_BOOT_GAP}" == "y" ]; then

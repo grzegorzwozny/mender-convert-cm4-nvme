@@ -1,0 +1,125 @@
+source configs/raspberrypi/uboot/debian/raspberrypi4_trixie_64bit_config
+
+# U-Boot bundle produced by scripts/uboot/build-uboot-rpi64-nvme.sh.
+# If assets/${RASPBERRYPI_BINARIES} exists, mender-convert uses it directly.
+# The current helper script generates fw_env.config pointing to /dev/mmcblk0
+# raw offsets for U-Boot env storage.
+RASPBERRYPI_BINARIES="raspberrypi_arm64_cm4_nvme-2024.04.tar.gz"
+RASPBERRYPI_BINARIES_URL="${MENDER_STORAGE_URL}/mender-convert/uboot/raspberrypi64/${RASPBERRYPI_BINARIES}"
+
+MENDER_STORAGE_DEVICE_BASE="/dev/nvme0n1"
+
+MENDER_BOOT_PART_SIZE_MB="512"
+MENDER_DATA_PART_SIZE_MB="512"
+# 2x rootfs(6144 MiB) + boot(512 MiB) + data(512 MiB) + partition overhead(24 MiB @ 4 MiB align)
+MENDER_STORAGE_TOTAL_SIZE_MB="13336"
+
+# 4 MiB alignment
+MENDER_PARTITION_ALIGNMENT="4194304"
+
+MENDER_ARTIFACT_NAME="cm4-nvme-trixie-ab6gb"
+
+# Keep /data fixed at initial size for this profile.
+MENDER_DATA_PART_GROWFS="n"
+
+# Resolve final partition UUIDs from the generated image and inject them where needed.
+MENDER_FORCE_PARTUUID_FSTAB="y"
+MENDER_FORCE_PARTUUID_MENDER_CONF="y"
+
+function cm4_nvme_sanity_check() {
+    local sanity_failed=0
+    local part_count=0
+    local loop_device=""
+    local boot_part_device=""
+    local rootfsa_part_device=""
+    local data_part_device=""
+    local sanity_dir="work/cm4-nvme-sanity"
+
+    log_info "Running CM4 NVMe sanity checks"
+
+    part_count=$(partx --show "${img_path}" | tail -n +2 | wc -l)
+    if [ "${part_count}" -ne 4 ]; then
+        log_error "Expected 4 partitions in '${img_path}', found '${part_count}'"
+        sanity_failed=1
+    fi
+
+    loop_device=$(sudo losetup --show -fP "${img_path}")
+    boot_part_device=$(disk_get_part_device_from_base "${loop_device}" "${MENDER_BOOT_PART_NUMBER}")
+    rootfsa_part_device=$(disk_get_part_device_from_base "${loop_device}" "${MENDER_ROOTFS_PART_A_NUMBER}")
+    data_part_device=$(disk_get_part_device_from_base "${loop_device}" "${MENDER_DATA_PART_NUMBER}")
+
+    run_and_log_cmd "sudo mkdir -p ${sanity_dir}/boot ${sanity_dir}/rootfs ${sanity_dir}/data"
+    if ! run_and_log_cmd_noexit "sudo mount ${boot_part_device} ${sanity_dir}/boot"; then
+        log_error "Failed to mount boot partition from '${img_path}'"
+        sanity_failed=1
+    fi
+    if ! run_and_log_cmd_noexit "sudo mount ${rootfsa_part_device} ${sanity_dir}/rootfs"; then
+        log_error "Failed to mount rootfsA partition from '${img_path}'"
+        sanity_failed=1
+    fi
+    if ! run_and_log_cmd_noexit "sudo mount ${data_part_device} ${sanity_dir}/data"; then
+        log_error "Failed to mount data partition from '${img_path}'"
+        sanity_failed=1
+    fi
+
+    if [ "${sanity_failed}" -eq 0 ]; then
+        if ! grep -Eq '^PARTUUID=[^[:space:]]+[[:space:]]+/boot/firmware[[:space:]]+' "${sanity_dir}/rootfs/etc/fstab"; then
+            log_error "/etc/fstab does not mount /boot/firmware via PARTUUID"
+            sanity_failed=1
+        fi
+
+        if ! grep -Eq '^PARTUUID=[^[:space:]]+[[:space:]]+/data[[:space:]]+' "${sanity_dir}/rootfs/etc/fstab"; then
+            log_error "/etc/fstab does not mount /data via PARTUUID"
+            sanity_failed=1
+        fi
+
+        if grep -q '/dev/mmcblk0' "${sanity_dir}/rootfs/etc/fstab"; then
+            log_error "Found /dev/mmcblk0 reference in /etc/fstab"
+            sanity_failed=1
+        fi
+
+        if grep -q '/dev/mmcblk0' "${sanity_dir}/boot/cmdline.txt"; then
+            log_error "Found /dev/mmcblk0 reference in cmdline.txt"
+            sanity_failed=1
+        fi
+
+        if grep -q '/dev/nvme' "${sanity_dir}/boot/cmdline.txt"; then
+            log_error "Found static /dev/nvme reference in cmdline.txt"
+            sanity_failed=1
+        fi
+
+        if ! grep -q 'root=${mender_kernel_root}' "${sanity_dir}/boot/cmdline.txt"; then
+            log_error "cmdline.txt is missing dynamic Mender root selector"
+            sanity_failed=1
+        fi
+
+        if grep -q 'x-systemd.growfs' "${sanity_dir}/rootfs/etc/fstab"; then
+            log_error "Found x-systemd.growfs in /etc/fstab, expected fixed /data size profile"
+            sanity_failed=1
+        fi
+
+        if [ ! -f "${sanity_dir}/boot/uboot-git-log.txt" ]; then
+            log_error "Missing uboot-git-log.txt in boot partition"
+            sanity_failed=1
+        fi
+
+        if ! grep -Eq '"RootfsPartA": "/dev/disk/by-partuuid/.+"' "${sanity_dir}/data/mender/mender.conf"; then
+            log_error "mender.conf does not use /dev/disk/by-partuuid for RootfsPartA"
+            sanity_failed=1
+        fi
+        if ! grep -Eq '"RootfsPartB": "/dev/disk/by-partuuid/.+"' "${sanity_dir}/data/mender/mender.conf"; then
+            log_error "mender.conf does not use /dev/disk/by-partuuid for RootfsPartB"
+            sanity_failed=1
+        fi
+    fi
+
+    run_and_log_cmd_noexit "sudo umount -f ${sanity_dir}/boot" || true
+    run_and_log_cmd_noexit "sudo umount -f ${sanity_dir}/rootfs" || true
+    run_and_log_cmd_noexit "sudo umount -f ${sanity_dir}/data" || true
+    run_and_log_cmd_noexit "sudo losetup -d ${loop_device}" || true
+
+    if [ "${sanity_failed}" -ne 0 ]; then
+        log_fatal "CM4 NVMe sanity checks failed"
+    fi
+}
+PLATFORM_PACKAGE_HOOKS+=(cm4_nvme_sanity_check)

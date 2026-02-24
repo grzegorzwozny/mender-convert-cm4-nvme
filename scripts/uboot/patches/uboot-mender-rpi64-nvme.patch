@@ -1,0 +1,340 @@
+diff --git a/configs/rpi_arm64_defconfig b/configs/rpi_arm64_defconfig
+index 667764a6..1a8944b2 100644
+--- a/configs/rpi_arm64_defconfig
++++ b/configs/rpi_arm64_defconfig
+@@ -22,6 +22,7 @@ CONFIG_CMD_GPIO=y
+ CONFIG_CMD_MMC=y
+ CONFIG_CMD_PCI=y
+ CONFIG_CMD_USB=y
++CONFIG_CMD_NVME=y
+ CONFIG_CMD_FS_UUID=y
+ CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG=y
+ CONFIG_TFTP_TSIZE=y
+@@ -35,6 +36,8 @@ CONFIG_BCMGENET=y
+ CONFIG_PCI_BRCMSTB=y
+ CONFIG_PINCTRL=y
+ # CONFIG_PINCTRL_GENERIC is not set
++CONFIG_NVME=y
++CONFIG_NVME_PCI=y
+ CONFIG_DM_RNG=y
+ CONFIG_RNG_IPROC200=y
+ # CONFIG_REQUIRE_SERIAL_CONSOLE is not set
+diff --git a/drivers/core/of_addr.c b/drivers/core/of_addr.c
+index b3b3d7cc..c7635f64 100644
+--- a/drivers/core/of_addr.c
++++ b/drivers/core/of_addr.c
+@@ -383,7 +383,12 @@ int of_get_dma_range(const struct device_node *dev, phys_addr_t *cpu,
+ 	}
+ 
+ 	bus_node = of_match_bus(parent);
+-	bus_node->count_cells(parent, &pna, &pns);
++	/*
++	 * Keep using @dev here. of_n_addr_cells()/of_n_size_cells() walk one
++	 * level up internally, so passing @parent would resolve #cells from
++	 * the wrong level for dma-ranges parsing.
++	 */
++	bus_node->count_cells(dev, &pna, &pns);
+ 	if (!OF_CHECK_COUNTS(pna, pns)) {
+ 		printf("Bad cell count for %s\n", of_node_full_name(parent));
+ 		ret = -EINVAL;
+diff --git a/drivers/nvme/nvme.c b/drivers/nvme/nvme.c
+index 59a139ba..33a731cc 100644
+--- a/drivers/nvme/nvme.c
++++ b/drivers/nvme/nvme.c
+@@ -13,6 +13,7 @@
+ #include <log.h>
+ #include <malloc.h>
+ #include <memalign.h>
++#include <phys2bus.h>
+ #include <time.h>
+ #include <dm/device-internal.h>
+ #include <linux/compat.h>
+@@ -26,8 +27,15 @@
+ 				      ARCH_DMA_MINALIGN)
+ #define ADMIN_TIMEOUT		60
+ #define IO_TIMEOUT		30
++#define NVME_WAIT_CSTS_FALLBACK_TIMEOUT_MS	15000
+ #define MAX_PRP_POOL		512
+ 
++static inline dma_addr_t nvme_cpu_to_bus_addr(struct nvme_dev *dev,
++					      uintptr_t cpu_addr)
++{
++	return dev_phys_to_bus(dev->udev, virt_to_phys((void *)cpu_addr));
++}
++
+ static int nvme_wait_csts(struct nvme_dev *dev, u32 mask, u32 val)
+ {
+ 	int timeout;
+@@ -35,6 +43,8 @@ static int nvme_wait_csts(struct nvme_dev *dev, u32 mask, u32 val)
+ 
+ 	/* Timeout field in the CAP register is in 500 millisecond units */
+ 	timeout = NVME_CAP_TIMEOUT(dev->cap) * 500;
++	if (!timeout)
++		timeout = NVME_WAIT_CSTS_FALLBACK_TIMEOUT_MS;
+ 
+ 	start = get_timer(0);
+ 	while (get_timer(start) < timeout) {
+@@ -67,7 +77,7 @@ static int nvme_setup_prps(struct nvme_dev *dev, u64 *prp2,
+ 		dma_addr += (page_size - offset);
+ 
+ 	if (length <= page_size) {
+-		*prp2 = dma_addr;
++		*prp2 = nvme_cpu_to_bus_addr(dev, dma_addr);
+ 		return 0;
+ 	}
+ 
+@@ -92,16 +102,19 @@ static int nvme_setup_prps(struct nvme_dev *dev, u64 *prp2,
+ 	i = 0;
+ 	while (nprps) {
+ 		if ((i == (prps_per_page - 1)) && nprps > 1) {
+-			*(prp_pool + i) = cpu_to_le64((ulong)prp_pool +
+-					page_size);
++			*(prp_pool + i) = cpu_to_le64(
++				nvme_cpu_to_bus_addr(dev,
++						     (uintptr_t)prp_pool +
++						     page_size));
+ 			i = 0;
+ 			prp_pool += page_size;
+ 		}
+-		*(prp_pool + i++) = cpu_to_le64(dma_addr);
++		*(prp_pool + i++) = cpu_to_le64(
++			nvme_cpu_to_bus_addr(dev, dma_addr));
+ 		dma_addr += page_size;
+ 		nprps--;
+ 	}
+-	*prp2 = (ulong)dev->prp_pool;
++	*prp2 = nvme_cpu_to_bus_addr(dev, (uintptr_t)dev->prp_pool);
+ 
+ 	flush_dcache_range((ulong)dev->prp_pool, (ulong)dev->prp_pool +
+ 			   num_pages * page_size);
+@@ -394,8 +407,10 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
+ 	dev->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
+ 
+ 	writel(aqa, &dev->bar->aqa);
+-	nvme_writeq((ulong)nvmeq->sq_cmds, &dev->bar->asq);
+-	nvme_writeq((ulong)nvmeq->cqes, &dev->bar->acq);
++	nvme_writeq(nvme_cpu_to_bus_addr(dev, (uintptr_t)nvmeq->sq_cmds),
++		    &dev->bar->asq);
++	nvme_writeq(nvme_cpu_to_bus_addr(dev, (uintptr_t)nvmeq->cqes),
++		    &dev->bar->acq);
+ 
+ 	result = nvme_enable_ctrl(dev);
+ 	if (result)
+@@ -421,7 +436,8 @@ static int nvme_alloc_cq(struct nvme_dev *dev, u16 qid,
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.create_cq.opcode = nvme_admin_create_cq;
+-	c.create_cq.prp1 = cpu_to_le64((ulong)nvmeq->cqes);
++	c.create_cq.prp1 = cpu_to_le64(
++		nvme_cpu_to_bus_addr(dev, (uintptr_t)nvmeq->cqes));
+ 	c.create_cq.cqid = cpu_to_le16(qid);
+ 	c.create_cq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
+ 	c.create_cq.cq_flags = cpu_to_le16(flags);
+@@ -438,7 +454,8 @@ static int nvme_alloc_sq(struct nvme_dev *dev, u16 qid,
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.create_sq.opcode = nvme_admin_create_sq;
+-	c.create_sq.prp1 = cpu_to_le64((ulong)nvmeq->sq_cmds);
++	c.create_sq.prp1 = cpu_to_le64(
++		nvme_cpu_to_bus_addr(dev, (uintptr_t)nvmeq->sq_cmds));
+ 	c.create_sq.sqid = cpu_to_le16(qid);
+ 	c.create_sq.qsize = cpu_to_le16(nvmeq->q_depth - 1);
+ 	c.create_sq.sq_flags = cpu_to_le16(flags);
+@@ -452,32 +469,36 @@ int nvme_identify(struct nvme_dev *dev, unsigned nsid,
+ {
+ 	struct nvme_command c;
+ 	u32 page_size = dev->page_size;
+-	int offset = dma_addr & (page_size - 1);
++	dma_addr_t cpu_addr = dma_addr;
++	dma_addr_t cpu_addr_orig = cpu_addr;
++	int offset = cpu_addr & (page_size - 1);
+ 	int length = sizeof(struct nvme_id_ctrl);
+ 	int ret;
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.identify.opcode = nvme_admin_identify;
+ 	c.identify.nsid = cpu_to_le32(nsid);
+-	c.identify.prp1 = cpu_to_le64(dma_addr);
++	c.identify.prp1 = cpu_to_le64(nvme_cpu_to_bus_addr(dev, cpu_addr));
+ 
+ 	length -= (page_size - offset);
+ 	if (length <= 0) {
+ 		c.identify.prp2 = 0;
+ 	} else {
+-		dma_addr += (page_size - offset);
+-		c.identify.prp2 = cpu_to_le64(dma_addr);
++		cpu_addr += (page_size - offset);
++		c.identify.prp2 = cpu_to_le64(
++			nvme_cpu_to_bus_addr(dev, cpu_addr));
+ 	}
+ 
+ 	c.identify.cns = cpu_to_le32(cns);
+ 
+-	invalidate_dcache_range(dma_addr,
+-				dma_addr + sizeof(struct nvme_id_ctrl));
++	invalidate_dcache_range(cpu_addr_orig,
++				cpu_addr_orig + sizeof(struct nvme_id_ctrl));
+ 
+ 	ret = nvme_submit_admin_cmd(dev, &c, NULL);
+ 	if (!ret)
+-		invalidate_dcache_range(dma_addr,
+-					dma_addr + sizeof(struct nvme_id_ctrl));
++		invalidate_dcache_range(cpu_addr_orig,
++					cpu_addr_orig +
++					sizeof(struct nvme_id_ctrl));
+ 
+ 	return ret;
+ }
+@@ -491,7 +512,8 @@ int nvme_get_features(struct nvme_dev *dev, unsigned fid, unsigned nsid,
+ 	memset(&c, 0, sizeof(c));
+ 	c.features.opcode = nvme_admin_get_features;
+ 	c.features.nsid = cpu_to_le32(nsid);
+-	c.features.prp1 = cpu_to_le64(dma_addr);
++	c.features.prp1 = cpu_to_le64(
++		dma_addr ? nvme_cpu_to_bus_addr(dev, dma_addr) : 0);
+ 	c.features.fid = cpu_to_le32(fid);
+ 
+ 	ret = nvme_submit_admin_cmd(dev, &c, result);
+@@ -517,7 +539,8 @@ int nvme_set_features(struct nvme_dev *dev, unsigned fid, unsigned dword11,
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.features.opcode = nvme_admin_set_features;
+-	c.features.prp1 = cpu_to_le64(dma_addr);
++	c.features.prp1 = cpu_to_le64(
++		dma_addr ? nvme_cpu_to_bus_addr(dev, dma_addr) : 0);
+ 	c.features.fid = cpu_to_le32(fid);
+ 	c.features.dword11 = cpu_to_le32(dword11);
+ 
+@@ -786,7 +809,8 @@ static ulong nvme_blk_rw(struct udevice *udev, lbaint_t blknr,
+ 		c.rw.slba = cpu_to_le64(slba);
+ 		slba += lbas;
+ 		c.rw.length = cpu_to_le16(lbas - 1);
+-		c.rw.prp1 = cpu_to_le64(temp_buffer);
++		c.rw.prp1 = cpu_to_le64(
++			nvme_cpu_to_bus_addr(dev, temp_buffer));
+ 		c.rw.prp2 = cpu_to_le64(prp2);
+ 		status = nvme_submit_sync_cmd(dev->queues[NVME_IO_Q],
+ 				&c, NULL, IO_TIMEOUT);
+diff --git a/drivers/nvme/nvme_pci.c b/drivers/nvme/nvme_pci.c
+index 5bb43d29..312ce9f9 100644
+--- a/drivers/nvme/nvme_pci.c
++++ b/drivers/nvme/nvme_pci.c
+@@ -32,8 +32,12 @@ static int nvme_probe(struct udevice *udev)
+ 	ndev->bar = dm_pci_map_bar(udev, PCI_BASE_ADDRESS_0, 0, 0,
+ 				   PCI_REGION_TYPE, PCI_REGION_MEM);
+ 
+-	/* Turn on bus-mastering */
+-	dm_pci_clrset_config16(udev, PCI_COMMAND, 0, PCI_COMMAND_MASTER);
++	/* Turn on MMIO decoding and bus-mastering */
++	dm_pci_clrset_config16(udev, PCI_COMMAND, 0,
++			       PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++
++	/* Some devices need extra settle time even after link-up */
++	udelay(500000);
+ 
+ 	return nvme_init(udev);
+ }
+diff --git a/drivers/pci/pcie_brcmstb.c b/drivers/pci/pcie_brcmstb.c
+index cd45f0be..2bb2ddab 100644
+--- a/drivers/pci/pcie_brcmstb.c
++++ b/drivers/pci/pcie_brcmstb.c
+@@ -433,7 +433,7 @@ static int brcm_pcie_probe(struct udevice *dev)
+ 	struct pci_controller *hose = dev_get_uclass_priv(ctlr);
+ 	struct brcm_pcie *pcie = dev_get_priv(dev);
+ 	void __iomem *base = pcie->base;
+-	struct pci_region region;
++	struct pci_region region = { 0 };
+ 	bool ssc_good = false;
+ 	int num_out_wins = 0;
+ 	u64 rc_bar2_offset, rc_bar2_size;
+@@ -471,7 +471,22 @@ static int brcm_pcie_probe(struct udevice *dev)
+ 			MISC_CTRL_CFG_READ_UR_MODE_MASK |
+ 			MISC_CTRL_MAX_BURST_SIZE_128);
+ 
+-	pci_get_dma_regions(dev, &region, 0);
++	ret = pci_get_dma_regions(dev, &region, 0);
++	if (ret || !region.size) {
++		/*
++		 * Some firmware-provided DTBs for RPi4/CM4 do not expose
++		 * usable dma-ranges to U-Boot. Without a valid inbound DMA
++		 * window, NVMe admin commands time out (err=-110).
++		 */
++		printf("PCIe BRCM: invalid dma-ranges, using 1GB fallback DMA window\n");
++		region.bus_start = 0;
++		region.phys_start = 0;
++		region.size = 1ULL << 30;
++	}
++	printf("PCIe BRCM: inbound DMA window bus=%llx cpu=%llx size=%llx\n",
++	       (unsigned long long)region.bus_start,
++	       (unsigned long long)region.phys_start,
++	       (unsigned long long)region.size);
+ 	rc_bar2_offset = region.bus_start - region.phys_start;
+ 	rc_bar2_size = 1ULL << fls64(region.size - 1);
+ 
+@@ -518,9 +533,9 @@ static int brcm_pcie_probe(struct udevice *dev)
+ 	mdelay(100);
+ 
+ 	/* Give the RC/EP time to wake up, before trying to configure RC.
+-	 * Intermittently check status for link-up, up to a total of 100ms.
++	 * Intermittently check status for link-up, up to a total of 500ms.
+ 	 */
+-	for (i = 0; i < 100 && !brcm_pcie_link_up(pcie); i += 5)
++	for (i = 0; i < 500 && !brcm_pcie_link_up(pcie); i += 5)
+ 		mdelay(5);
+ 
+ 	if (!brcm_pcie_link_up(pcie)) {
+@@ -528,6 +543,9 @@ static int brcm_pcie_probe(struct udevice *dev)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Extra settle delay for downstream NVMe controllers */
++	mdelay(300);
++
+ 	if (!brcm_pcie_rc_mode(pcie)) {
+ 		printf("PCIe misconfigured; is in EP mode\n");
+ 		return -EINVAL;
+diff --git a/include/config_mender_defines.h b/include/config_mender_defines.h
+index 1dfac989..063c38e1 100644
+--- a/include/config_mender_defines.h
++++ b/include/config_mender_defines.h
+@@ -11,15 +11,15 @@
+ #define MENDER_ROOTFS_PART_A_NUMBER_HEX 2
+ #define MENDER_ROOTFS_PART_B_NUMBER 3
+ #define MENDER_ROOTFS_PART_B_NUMBER_HEX 3
+-#define MENDER_UBOOT_STORAGE_INTERFACE "mmc"
++#define MENDER_UBOOT_STORAGE_INTERFACE "nvme"
+ #define MENDER_UBOOT_STORAGE_DEVICE 0
+ 
+ /* BB variables. */
+-#define MENDER_STORAGE_DEVICE_BASE "/dev/mmcblk0p"
++#define MENDER_STORAGE_DEVICE_BASE "/dev/nvme0n1p"
+ #define MENDER_UBOOT_ENV_STORAGE_DEVICE_OFFSET_1 0x400000
+ #define MENDER_UBOOT_ENV_STORAGE_DEVICE_OFFSET_2 0x800000
+-#define MENDER_ROOTFS_PART_A_NAME "/dev/mmcblk0p2"
+-#define MENDER_ROOTFS_PART_B_NAME "/dev/mmcblk0p3"
++#define MENDER_ROOTFS_PART_A_NAME "/dev/nvme0n1p2"
++#define MENDER_ROOTFS_PART_B_NAME "/dev/nvme0n1p3"
+ 
+ /* For sanity checks. */
+ #define MENDER_BOOTENV_SIZE 0x4000
+@@ -27,6 +27,6 @@
+ #define MENDER_BOOT_KERNEL_TYPE "booti"
+ #define MENDER_KERNEL_NAME "vmlinux"
+ #define MENDER_DTB_NAME "bcm2711-rpi-4-b.dtb"
+-#define MENDER_UBOOT_PRE_SETUP_COMMANDS ""
++#define MENDER_UBOOT_PRE_SETUP_COMMANDS "pci enum; sleep 1; nvme scan;"
+ #define MENDER_UBOOT_POST_SETUP_COMMANDS ""
+ #endif /* !HEADER_CONFIG_MENDER_DEFINES_H */
+diff --git a/include/env_mender.h b/include/env_mender.h
+index c5f67a78..eafcf7b5 100644
+--- a/include/env_mender.h
++++ b/include/env_mender.h
+@@ -156,7 +156,7 @@
+ # define CONFIG_MENDER_BOOTCOMMAND                                      \
+     "fdt addr ${fdt_addr} && fdt get value bootargs /chosen bootargs; " \
+     "run mender_setup; "                                                \
+-    "mmc dev ${mender_uboot_dev}; "                                     \
++    "if test \"${mender_uboot_if}\" = \"mmc\"; then mmc dev ${mender_uboot_dev}; fi; " \
+     "if load ${mender_uboot_root} ${kernel_addr_r} /boot/vmlinux; then " \
+     "booti ${kernel_addr_r} - ${fdt_addr}; "                            \
+     "fi; "                                                              \

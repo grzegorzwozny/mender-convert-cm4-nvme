@@ -256,6 +256,14 @@ MENDER_DATA_PART_NUMBER="4"
 # Use partition uuids rather than device and partition numbers
 MENDER_ENABLE_PARTUUID="n"
 
+# Rewrite /etc/fstab entries for boot and data to use PARTUUID values generated
+# for the final partitioned image.
+MENDER_FORCE_PARTUUID_FSTAB="n"
+
+# Rewrite data/mender/mender.conf rootfs entries to /dev/disk/by-partuuid/*
+# values generated for the final partitioned image.
+MENDER_FORCE_PARTUUID_MENDER_CONF="n"
+
 # Partition used as the boot partition.
 MENDER_BOOT_PART=""
 
